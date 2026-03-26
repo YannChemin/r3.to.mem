@@ -1,0 +1,197 @@
+<h2>DESCRIPTION</h2>
+
+<em>r3.to.mem</em> extracts one or more 2D raster slices from a 3D raster
+(voxel) map and places them in a RAM-backed in-memory GRASS mapset.  The
+result is accessible to <em>r.mapcalc</em> and every other GRASS module
+without any special syntax: the in-memory mapset is added to the current
+session's SEARCH_PATH automatically.
+
+<h3>Why this module exists</h3>
+
+The standard per-voxel API (<tt>Rast3d_get_value</tt> /
+<tt>Rast3d_get_double</tt>) makes one function call and one tile-cache
+lookup per cell.  For a 1000&times;1000 slice that is one million calls.
+<em>r3.to.mem</em> instead opens the 3D map with
+<tt>RASTER3D_NO_CACHE</tt> and calls <tt>Rast3d_get_block()</tt>, which
+delegates to <tt>Rast3d_get_block_nocache()</tt>: it iterates over the
+tiles that span the target Z level and bulk-copies each tile once.  For
+a default 32&times;32&times;32 tile the call count drops from
+~1&nbsp;000&nbsp;000 to ~1&nbsp;000 (one per tile column), a typical
+speedup of 100&ndash;1000&times;.
+
+<p>
+The output 2D maps are written to a GRASS mapset whose backing directory
+sits on <tt>/dev/shm</tt> (Linux tmpfs).  All subsequent reads by
+<em>r.mapcalc</em> are therefore pure RAM I/O &mdash; no rotational disk
+or SSD involved.
+
+<h3>In-memory mapset mechanics</h3>
+
+On first use, <em>r3.to.mem</em>:
+<ol>
+  <li>Creates <tt>/dev/shm/grass_r3mem_&lt;location&gt;_&lt;mapset&gt;/</tt>.</li>
+  <li>Creates a symlink
+      <tt>$GISDBASE/$LOCATION/&lt;mapset&gt;&nbsp;&rarr;&nbsp;/dev/shm/&hellip;</tt>
+      so GRASS can find the mapset by name.</li>
+  <li>Writes a <tt>WIND</tt> file (copied from PERMANENT) to initialise
+      the mapset.</li>
+  <li>Adds the mapset name to the persistent <tt>SEARCH_PATH</tt> file
+      of the current mapset, so every subsequent GRASS process in this
+      session finds the RAM maps without <tt>@MEMORY</tt>
+      qualification.</li>
+</ol>
+
+The directory in <tt>/dev/shm</tt> is stable across multiple calls with
+the same mapset name &mdash; maps are simply overwritten if they already
+exist.  The <tt>/dev/shm</tt> directory is cleared on reboot; the
+symlink in the GRASS location persists until the <b>-c</b> flag is used.
+
+<p>
+If <tt>/dev/shm</tt> is not available (non-Linux systems),
+<em>r3.to.mem</em> falls back to <tt>$TMPDIR</tt> or <tt>/tmp</tt>.
+
+<h2>NOTES</h2>
+
+<h3>Output map naming</h3>
+<ul>
+  <li>
+    <b>Single slice</b> (<tt>zrange=5</tt>): output map is named exactly
+    as specified by <tt>output=</tt>.
+  </li>
+  <li>
+    <b>Multiple slices</b> (<tt>zrange=all</tt> or a list/range): output
+    maps are named <tt>&lt;output&gt;.&lt;z&gt;</tt> where <tt>z</tt>
+    is the zero-based Z index.
+  </li>
+</ul>
+
+<h3>Coordinate system</h3>
+
+<tt>Rast3d_get_block()</tt> uses native 3D map coordinates (column&nbsp;=&nbsp;X,
+row&nbsp;=&nbsp;Y, depth&nbsp;=&nbsp;Z with Z=0 at the bottom).  The Z
+index in <tt>zrange</tt> corresponds directly to the depth index in the
+3D map.  Both 2D and 3D GRASS maps use row 0 = northernmost, so no row
+reversal is needed.
+
+<h3>Null values</h3>
+
+<tt>Rast3d_set_null_value()</tt> delegates to
+<tt>Rast_set_f/d_null_value()</tt>: the 3D and 2D null bit patterns are
+identical.  No conversion step is required when copying the block buffer
+to <tt>Rast_put_*_row()</tt>.
+
+<h3>Region alignment</h3>
+
+The 2D computation region should match the XY extent of the 3D map.
+<em>r3.to.mem</em> emits a warning if they differ and writes the output
+maps at the 3D map&rsquo;s native resolution.  Use
+<tt>g.region&nbsp;raster3d=&lt;input&gt;</tt> to align the 2D region
+before running the module.
+
+<h3>Memory management and cleanup</h3>
+
+Two cleanup modes are provided for different workflow needs:
+
+<dl>
+  <dt><b>Full cleanup</b> (<tt>-c</tt> flag)</dt>
+  <dd>
+    Removes the entire RAM mapset in one operation: deletes the
+    <tt>/dev/shm</tt> directory tree, the symlink in the GRASS location,
+    and the <tt>SEARCH_PATH</tt> entry.  Use this at the end of a
+    processing session or when switching to a different 3D source.
+    <tt>input=</tt> is not required.
+  </dd>
+
+  <dt><b>Per-map cleanup</b> (<tt>remove=</tt> option)</dt>
+  <dd>
+    Removes one or more named 2D raster maps from the RAM mapset without
+    touching the mapset structure itself.  Accepts a comma-separated list
+    of map names.  Use this inside iterative band-by-band loops to keep
+    RAM usage bounded: load a slice, process it, remove it, then load
+    the next one.  <tt>input=</tt> is not required.
+  </dd>
+</dl>
+
+Without an explicit cleanup call, <tt>/dev/shm</tt> storage is reclaimed
+automatically on the next reboot.  The symlink in the GRASS location
+directory is harmless if the <tt>/dev/shm</tt> target no longer exists.
+
+<h2>EXAMPLES</h2>
+
+<h3>Extract a single band from a hyperspectral cube</h3>
+<div class="code"><pre>
+r3.to.mem input=hypercube zrange=42 output=band_42
+r.mapcalc "reflectance = band_42 * 0.0001"
+</pre></div>
+
+<h3>Extract a range of bands and compute an index</h3>
+<div class="code"><pre>
+r3.to.mem input=hypercube zrange=10-19 output=band
+# bands are now band.10 .. band.19 in mapset MEMORY
+r.mapcalc "ndvi = (band.15 - band.10) / (band.15 + band.10)"
+</pre></div>
+
+<h3>Extract all slices in a single disk-read pass</h3>
+<div class="code"><pre>
+r3.to.mem input=temperature_cube output=temp
+# creates temp.0 .. temp.N in mapset MEMORY
+</pre></div>
+
+<h3>Iterative band-by-band processing with per-map cleanup</h3>
+
+Useful when the full cube does not fit in RAM or when downstream
+processing is band-sequential:
+
+<div class="code"><pre>
+# Get total depth count
+eval $(r3.to.mem input=hypercube -l | tr ' ' '\n' | grep depths)
+
+for z in $(seq 0 $((depths - 1))); do
+    # Load one band into RAM
+    r3.to.mem input=hypercube zrange=${z} output=band
+
+    # Process
+    r.mapcalc "result_${z} = band * scale_factor_${z}"
+
+    # Free RAM before next iteration
+    r3.to.mem remove=band mapset=MEMORY
+done
+</pre></div>
+
+<h3>Keep cubes from different sources in separate mapsets</h3>
+<div class="code"><pre>
+r3.to.mem input=cube_jan output=jan mapset=JAN_MEM
+r3.to.mem input=cube_feb output=feb mapset=FEB_MEM
+r.mapcalc "diff = jan.5@JAN_MEM - feb.5@FEB_MEM"
+</pre></div>
+
+<h3>List cube dimensions before extraction</h3>
+<div class="code"><pre>
+r3.to.mem input=hypercube -l
+# map=hypercube  depths=128  rows=1000  cols=1000  type=FCELL
+</pre></div>
+
+<h3>Full cleanup at end of session</h3>
+<div class="code"><pre>
+r3.to.mem -c mapset=MEMORY
+</pre></div>
+
+<h3>Remove specific maps without tearing down the mapset</h3>
+<div class="code"><pre>
+r3.to.mem remove=band.10,band.11,band.12 mapset=MEMORY
+</pre></div>
+
+<h2>SEE ALSO</h2>
+
+<em>
+<a href="r3.to.rast.html">r3.to.rast</a>,
+<a href="r.mapcalc.html">r.mapcalc</a>,
+<a href="r3.mapcalc.html">r3.mapcalc</a>,
+<a href="g.mapsets.html">g.mapsets</a>,
+<a href="g.region.html">g.region</a>
+</em>
+
+<h2>AUTHOR</h2>
+
+Written for fast hyperspectral processing workflows
+(e.g. <em>i.hyper.atcorr</em>, <em>i.hyper.geology</em>).
